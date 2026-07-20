@@ -1,34 +1,36 @@
-using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Reflection;
-using Godot;
+using System.Reflection.Emit;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Modding;
 
 namespace STS2Mobile.Patches;
 
-// Extends ModManager to scan an external mods directory on Android so users
-// can sideload mods to /storage/emulated/0/StS2Launcher/Mods/ without root.
+// Redirects the game's mod scan to Android external storage without relying on
+// private fields that changed in newer game assemblies.
 public static class ModLoaderPatches
 {
-    private static readonly BindingFlags AllStatic =
-        BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
-
     public static void Apply(Harmony harmony)
     {
         PatchHelper.Patch(
             harmony,
             typeof(ModManager),
             "Initialize",
-            postfix: PatchHelper.Method(typeof(ModLoaderPatches), nameof(InitializePostfix))
+            transpiler: PatchHelper.Method(typeof(ModLoaderPatches), nameof(InitializeTranspiler))
+        );
+        PatchHelper.Patch(
+            harmony,
+            typeof(ModManager),
+            "ReadSteamMods",
+            prefix: PatchHelper.Method(typeof(ModLoaderPatches), nameof(ReadSteamModsPrefix))
         );
     }
 
-    // Runs after the original Initialize() to pick up mods from external storage.
-    // Temporarily clears _initialized so TryLoadModFromPck accepts new entries.
-    public static void InitializePostfix()
+    /// <summary>Rewrites the game's desktop mods path to the Android external directory.</summary>
+    public static IEnumerable<CodeInstruction> InitializeTranspiler(
+        IEnumerable<CodeInstruction> instructions
+    )
     {
+<<<<<<< HEAD
         // The base-game update refactored ModManager: it removed the _initialized and
         // _loadedMods fields, renamed LoadModsInDirRecursive -> ReadModsInDirRecursive,
         // replaced Mod.wasLoaded with Mod.state, and ModManager.LoadedMods with
@@ -39,5 +41,30 @@ public static class ModLoaderPatches
             "[Mods] External-mods sideloading disabled on this build "
                 + "(pending port to the updated ModManager API)."
         );
+=======
+        // 1. Locate Path.Combine(directoryName, "mods") in ModManager.Initialize.
+        var matcher = new CodeMatcher(instructions).MatchStartForward(
+            new CodeMatch(OpCodes.Ldstr, "mods")
+        );
+
+        // 2. Replace the desktop path construction with the validated launcher path.
+        if (matcher.IsValid)
+        {
+            matcher.Advance(-1);
+            matcher.RemoveInstructions(3);
+            matcher.InsertAndAdvance(new CodeInstruction(OpCodes.Ldstr, AppPaths.ExternalModsDir));
+            PatchHelper.Log($"[Mods] Redirected scan to {AppPaths.ExternalModsDir}");
+        }
+        else
+        {
+            PatchHelper.Log(
+                "[Mods] ModManager.Initialize path pattern changed; external mods are disabled"
+            );
+        }
+
+        return matcher.InstructionEnumeration();
+>>>>>>> b0846fc (Fix game update caches and Steam mobile auth)
     }
+
+    public static bool ReadSteamModsPrefix() => false;
 }

@@ -20,7 +20,9 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.security.KeyStore;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -71,6 +73,7 @@ public class GodotApp extends GodotActivity {
 		// Must be called before any native FMOD calls.
 		FMOD.init(this);
 
+		invalidateStaleAtlasCache();
 		setupAssemblies();
 		extractAssetFile("FMOD_LOGOS/FMOD Logo White - Transparent Background.png", "fmod_logo.png");
 
@@ -88,6 +91,57 @@ public class GodotApp extends GodotActivity {
 		}
 	}
 
+	/** Invalidates mobile texture imports whenever the downloaded game PCK changes. */
+	private void invalidateStaleAtlasCache() {
+		// 1. Compare the current game payload with the last successfully prepared payload.
+		File pck = new File(gameDir, PCK_FILE);
+		if (!pck.isFile()) {
+			return;
+		}
+
+		SharedPreferences prefs = getSharedPreferences("sts2mobile", MODE_PRIVATE);
+		long currentMtime = pck.lastModified();
+		long preparedMtime = prefs.getLong("atlas_cache_pck_mtime", 0L);
+		if (preparedMtime == currentMtime) {
+			return;
+		}
+
+		// 2. Remove only generated texture imports. Saves, credentials, and Mono stay intact.
+		int removed = 0;
+		String[] cachePaths = {
+				".godot/imported",
+				"etc2_cache/.godot/imported",
+		};
+		for (String cachePath : cachePaths) {
+			File cacheDir = new File(getFilesDir(), cachePath);
+			if (cacheDir.exists()) {
+				removed += deleteRecursively(cacheDir);
+			}
+		}
+
+		// 3. Record only after every stale cache entry was removed successfully.
+		prefs.edit().putLong("atlas_cache_pck_mtime", currentMtime).apply();
+		Log.i(TAG, "Atlas cache prepared for PCK mtime " + currentMtime
+				+ " (previous " + preparedMtime + ", removed " + removed + " entries)");
+	}
+
+	private int deleteRecursively(File target) {
+		int removed = 0;
+		if (target.isDirectory()) {
+			File[] children = target.listFiles();
+			if (children == null) {
+				throw new IllegalStateException("Failed to list atlas cache directory: " + target);
+			}
+			for (File child : children) {
+				removed += deleteRecursively(child);
+			}
+		}
+		if (!target.delete()) {
+			throw new IllegalStateException("Failed to delete stale atlas cache entry: " + target);
+		}
+		return removed + 1;
+	}
+
 	private boolean isNewVersion() {
 		SharedPreferences prefs = getSharedPreferences("sts2mobile", MODE_PRIVATE);
 		int lastVersion = prefs.getInt("installed_version_code", -1);
@@ -100,29 +154,21 @@ public class GodotApp extends GodotActivity {
 		return true;
 	}
 
-	// Copies .NET BCL from APK assets and game assemblies from the download
-	// directory
-	// into the location Godot expects. Skips if already done unless the APK version
-	// changed.
+	/** Synchronizes Android BCL and downloaded game assemblies into Godot's Mono path. */
 	private void setupAssemblies() {
+		// 1. Prepare the destination on every boot so game-only assemblies can be refreshed.
 		File srcDir = findAssembliesDir();
 		File destDir = new File(getFilesDir(), ".godot/mono/publish/arm64");
 
 		boolean versionChanged = isNewVersion();
-
-		File patcherMarker = new File(destDir, "STS2Mobile.dll");
-		File sts2Marker = new File(destDir, "sts2.dll");
-		if (sts2Marker.exists() && patcherMarker.exists() && !versionChanged) {
-			Log.i(TAG, "Assemblies already set up at: " + destDir.getAbsolutePath());
-			return;
-		}
-
 		if (versionChanged) {
 			Log.i(TAG, "New version detected, re-copying all assemblies");
 		}
 
 		destDir.mkdirs();
 
+		// 2. Refresh the Android BCL and retain its names as the ownership boundary.
+		Set<String> bclNames = new HashSet<>();
 		try {
 			String[] bclFiles = getAssets().list("dotnet_bcl");
 			if (bclFiles != null) {
@@ -135,6 +181,7 @@ public class GodotApp extends GodotActivity {
 						while ((len = in.read(buf)) > 0) {
 							out.write(buf, 0, len);
 						}
+						bclNames.add(name);
 						count++;
 					}
 				}
@@ -142,11 +189,10 @@ public class GodotApp extends GodotActivity {
 			}
 		} catch (IOException e) {
 			Log.e(TAG, "Failed to copy BCL assemblies", e);
+			return;
 		}
 
-		// Only copy game assemblies that don't already exist in BCL. The depot has
-		// desktop
-		// CoreCLR versions that are incompatible with Android's Mono runtime.
+		// 3. Refresh changed game assemblies without allowing desktop CoreCLR to replace BCL.
 		if (!srcDir.exists() || !srcDir.isDirectory()) {
 			Log.w(TAG, "Game assemblies source dir not found: " + srcDir.getAbsolutePath());
 			return;
@@ -158,14 +204,23 @@ public class GodotApp extends GodotActivity {
 			return;
 
 		int count = 0;
+		int skipped = 0;
+		int bclProtected = 0;
 		for (File src : files) {
 			if (src.isFile()) {
 				String name = src.getName();
 				if (name.endsWith(".so")) {
 					continue;
 				}
+				if (bclNames.contains(name)) {
+					bclProtected++;
+					continue;
+				}
 				File dest = new File(destDir, name);
-				if (dest.exists()) {
+				if (dest.exists()
+						&& dest.length() == src.length()
+						&& dest.lastModified() >= src.lastModified()) {
+					skipped++;
 					continue;
 				}
 				try {
@@ -176,7 +231,8 @@ public class GodotApp extends GodotActivity {
 				}
 			}
 		}
-		Log.i(TAG, "Copied " + count + " game assembly files");
+		Log.i(TAG, "Copied " + count + " game assembly files (skipped " + skipped
+				+ " up-to-date, " + bclProtected + " BCL-protected)");
 	}
 
 	private File findAssembliesDir() {

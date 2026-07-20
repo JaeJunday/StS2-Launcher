@@ -28,6 +28,8 @@ public class SteamAuth : IDisposable
 
     // Set when the WebSocket drops during 2FA wait (e.g. user backgrounds app).
     internal volatile bool NeedsReconnectForAuth;
+    private volatile bool _mobileConfirmationRequested;
+    private volatile bool _forceSteamGuardCodeEntry;
 
     public event Action<string> LogMessage;
 
@@ -79,6 +81,7 @@ public class SteamAuth : IDisposable
         string guardData
     )
     {
+        // 1. Establish the Steam authentication connection.
         if (!_connectedGate.IsSet)
         {
             Connect();
@@ -90,24 +93,62 @@ public class SteamAuth : IDisposable
 
         Log($"Authenticating as '{username}'...");
 
-        var authSession = await _client.Authentication.BeginAuthSessionViaCredentialsAsync(
-            new AuthSessionDetails
+        // 2. Prefer mobile confirmation, then retry once with a Steam Guard code if
+        // Android backgrounding drops the WebSocket while the Steam app is open.
+        _forceSteamGuardCodeEntry = false;
+        bool retriedWithSteamGuardCode = false;
+
+        while (true)
+        {
+            _mobileConfirmationRequested = false;
+            var authSession = await _client.Authentication.BeginAuthSessionViaCredentialsAsync(
+                new AuthSessionDetails
+                {
+                    Username = username,
+                    Password = password,
+                    IsPersistentSession = true,
+                    GuardData = guardData,
+                    Authenticator = new AuthAuthenticator(this),
+                }
+            );
+
+            try
             {
-                Username = username,
-                Password = password,
-                IsPersistentSession = true,
-                GuardData = guardData,
-                Authenticator = new AuthAuthenticator(this),
+                var pollResponse = await authSession.PollingWaitForResultAsync();
+                string newGuardData = pollResponse.NewGuardData ?? guardData;
+
+                Log($"Authentication successful for '{pollResponse.AccountName}'");
+                return new AuthResult(
+                    pollResponse.AccountName,
+                    pollResponse.RefreshToken,
+                    newGuardData
+                );
             }
-        );
+            catch (AsyncJobFailedException)
+                when (_mobileConfirmationRequested && !retriedWithSteamGuardCode)
+            {
+                retriedWithSteamGuardCode = true;
+                _forceSteamGuardCodeEntry = true;
+                Log(
+                    "Steam mobile confirmation disconnected; falling back to Steam Guard code entry"
+                );
 
-        var pollResponse = await authSession.PollingWaitForResultAsync();
+                if (NeedsReconnectForAuth || !_connectedGate.IsSet)
+                    await ReconnectForAuthAsync();
+            }
+            catch (TaskCanceledException)
+                when (_mobileConfirmationRequested && !retriedWithSteamGuardCode)
+            {
+                retriedWithSteamGuardCode = true;
+                _forceSteamGuardCodeEntry = true;
+                Log(
+                    "Steam mobile confirmation was canceled; falling back to Steam Guard code entry"
+                );
 
-        string newGuardData = pollResponse.NewGuardData ?? guardData;
-
-        Log($"Authentication successful for '{pollResponse.AccountName}'");
-
-        return new AuthResult(pollResponse.AccountName, pollResponse.RefreshToken, newGuardData);
+                if (NeedsReconnectForAuth || !_connectedGate.IsSet)
+                    await ReconnectForAuthAsync();
+            }
+        }
     }
 
     internal async Task ReconnectForAuthAsync()
@@ -196,6 +237,13 @@ public class SteamAuth : IDisposable
 
         public Task<bool> AcceptDeviceConfirmationAsync()
         {
+            if (_auth._forceSteamGuardCodeEntry)
+            {
+                _auth.Log("Using Steam Guard code entry after mobile confirmation failed");
+                return Task.FromResult(false);
+            }
+
+            _auth._mobileConfirmationRequested = true;
             _auth.Log("Waiting for Steam mobile app confirmation...");
             return Task.FromResult(true);
         }
