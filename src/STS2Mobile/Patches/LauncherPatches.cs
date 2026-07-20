@@ -104,6 +104,13 @@ public static class LauncherPatches
     {
         var gameNode = (Node)game;
 
+        // 1. Initialize local settings before NInputManager's asynchronous startup resumes.
+        // The launcher delays GameStartup, but input initialization starts from the scene's
+        // _Ready callback and requires SettingsSave to exist.
+        SaveManager.Instance.InitSettingsData();
+        PatchHelper.Log("[Launcher] Local settings initialized before input startup");
+
+        // 2. Wait for authentication and the explicit Play action.
         var launcher = new LauncherUI();
         gameNode.AddChild(launcher);
         launcher.SetGameMode(true);
@@ -113,6 +120,7 @@ public static class LauncherPatches
         await launcher.WaitForLaunch();
         PatchHelper.Log("User launched game, proceeding to startup...");
 
+        // 3. Recreate SaveManager with the authenticated account's cloud store.
         var instanceField = typeof(SaveManager).GetField(
             "_instance",
             BindingFlags.NonPublic | BindingFlags.Static
@@ -125,6 +133,7 @@ public static class LauncherPatches
 
         launcher.QueueFree();
 
+        // 4. Complete the normal game startup sequence.
         if (ShaderWarmupScreen.NeedsWarmup())
         {
             var warmup = new ShaderWarmupScreen();

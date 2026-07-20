@@ -30,24 +30,15 @@ public static class ModLoaderPatches
         IEnumerable<CodeInstruction> instructions
     )
     {
-<<<<<<< HEAD
-        // The base-game update refactored ModManager: it removed the _initialized and
-        // _loadedMods fields, renamed LoadModsInDirRecursive -> ReadModsInDirRecursive,
-        // replaced Mod.wasLoaded with Mod.state, and ModManager.LoadedMods with
-        // ModManager.GetLoadedMods(). The external-mods sideload logic here relied on the
-        // old shape, so it is disabled until ported. Steam Workshop mods are unaffected
-        // (the game's own ModManager.Initialize still handles those).
-        PatchHelper.Log(
-            "[Mods] External-mods sideloading disabled on this build "
-                + "(pending port to the updated ModManager API)."
-        );
-=======
-        // 1. Locate Path.Combine(directoryName, "mods") in ModManager.Initialize.
+        // The base game refactored ModManager over 2026 (LoadModsInDirRecursive ->
+        // ReadModsInDirRecursive, Mod.wasLoaded -> Mod.state), so this patch no longer
+        // touches those private members. Only the "mods" directory string literal is
+        // rewritten, which has stayed stable across the refactors; if the pattern is
+        // gone the original bytecode is left untouched and external mods stay disabled.
         var matcher = new CodeMatcher(instructions).MatchStartForward(
             new CodeMatch(OpCodes.Ldstr, "mods")
         );
 
-        // 2. Replace the desktop path construction with the validated launcher path.
         if (matcher.IsValid)
         {
             matcher.Advance(-1);
@@ -63,7 +54,6 @@ public static class ModLoaderPatches
         }
 
         return matcher.InstructionEnumeration();
->>>>>>> b0846fc (Fix game update caches and Steam mobile auth)
     }
 
     public static bool ReadSteamModsPrefix() => false;

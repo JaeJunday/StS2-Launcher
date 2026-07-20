@@ -53,8 +53,10 @@ public static class PlatformPatches
             prefix: PatchHelper.Method(typeof(PlatformPatches), nameof(SkipPrefix))
         );
 
-        // Android can append Unicode locale extensions for regional preferences
-        // (e.g. "de-DE-u-mu-celsius") which CultureInfo cannot parse here.
+        // Android appends Unicode extensions for regional preferences
+        // (e.g. "de-DE-u-mu-celsius" or "zh-CN-#Hans-u-mu-celsius") which the game's
+        // CultureInfo lookup cannot parse; the resulting exception aborts every label's
+        // _Ready() and shows up as a black screen after Play.
         PatchGetRawLanguage(harmony);
     }
 
@@ -82,6 +84,8 @@ public static class PlatformPatches
         return true;
     }
 
+    // Installed by reflection: the type moved between game builds, and a missing type
+    // must not abort the rest of the patch set.
     private static void PatchGetRawLanguage(Harmony harmony)
     {
         try
@@ -123,35 +127,65 @@ public static class PlatformPatches
         }
     }
 
-    // Strip Unicode extension subtags before the game's language-code logic runs.
+    // Keep language + region, drop Unicode/private extension subtags, never throw.
     public static void GetRawLanguagePostfix(ref string __result)
     {
         var raw = __result;
-        var sanitized = StripUnicodeExtensions(raw?.Replace('_', '-') ?? "");
-        if (string.IsNullOrWhiteSpace(sanitized))
-        {
-            PatchHelper.Log($"Locale fix: raw='{raw}' sanitized empty; using 'en-US'");
-            __result = "en-US";
-            return;
-        }
-
+        var sanitized = NormalizeAndroidLanguage(raw);
         if (sanitized != raw)
-            PatchHelper.Log($"Locale fix: raw='{raw}' sanitized='{sanitized}'");
-
+            PatchHelper.Log($"[Locale] Normalized '{raw}' to '{sanitized}'");
         __result = sanitized;
     }
 
-    // Strips Unicode extension subtags while preserving the base locale.
-    // Examples: "de-DE-u-mu-celsius" -> "de-DE", "en-US-#u-ms-metric" -> "en-US".
-    private static string StripUnicodeExtensions(string locale)
+    /// <summary>Keep the language and region while removing Android locale extensions.</summary>
+    private static string NormalizeAndroidLanguage(string rawLanguage)
     {
-        var unicodeIdx = locale.IndexOf("-u-", StringComparison.OrdinalIgnoreCase);
-        var legacyUnicodeIdx = locale.IndexOf("-#u-", StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(rawLanguage))
+            return "en-US";
 
-        var idx = unicodeIdx;
-        if (idx < 0 || (legacyUnicodeIdx >= 0 && legacyUnicodeIdx < idx))
-            idx = legacyUnicodeIdx;
+        var normalized = rawLanguage.Replace('_', '-');
+        var fragments = normalized.Split('-', StringSplitOptions.RemoveEmptyEntries);
 
-        return idx >= 0 ? locale.Substring(0, idx) : locale;
+        // 1. Validate the required language subtag at the Android locale boundary.
+        if (
+            fragments.Length == 0
+            || fragments[0].Length is < 2 or > 3
+            || !ContainsOnlyAsciiLetters(fragments[0])
+        )
+        {
+            PatchHelper.Log($"[Locale] Unusable locale '{rawLanguage}'; falling back to 'en-US'");
+            return "en-US";
+        }
+
+        // 2. Retain the two-letter region before any Unicode/private extension.
+        string region = null;
+        for (var index = 1; index < fragments.Length; index++)
+        {
+            var fragment = fragments[index];
+            if (fragment.Length == 1 || fragment.Equals("#u", StringComparison.OrdinalIgnoreCase))
+                break;
+            if (fragment.StartsWith('#'))
+                continue;
+            if (fragment.Length == 2 && ContainsOnlyAsciiLetters(fragment))
+            {
+                region = fragment;
+                break;
+            }
+        }
+
+        // 3. Return a CultureInfo-compatible identifier used by the game's own mapper.
+        return region == null ? fragments[0] : $"{fragments[0]}-{region}";
+    }
+
+    private static bool ContainsOnlyAsciiLetters(string value)
+    {
+        foreach (var character in value)
+        {
+            var isUppercaseAscii = character is >= 'A' and <= 'Z';
+            var isLowercaseAscii = character is >= 'a' and <= 'z';
+            if (!isUppercaseAscii && !isLowercaseAscii)
+                return false;
+        }
+        return true;
     }
 }
