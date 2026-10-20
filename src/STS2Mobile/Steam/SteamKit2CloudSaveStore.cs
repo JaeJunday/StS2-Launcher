@@ -42,10 +42,6 @@ public class SteamKit2CloudSaveStore : ICloudSaveStore, ISaveStore, IDisposable
         _connection.Flush();
     }
 
-    // The cloud-backed store is only constructed after the user enables Steam Cloud.
-    // Returning false makes the current game force local data over cloud data.
-    public bool HasUserEnabledCloudSync() => true;
-
     public void Dispose()
     {
         _writeQueue.Dispose();
