@@ -5,6 +5,7 @@ using Godot.Bridge;
 using Godot.NativeInterop;
 using HarmonyLib;
 using STS2Mobile.Launcher;
+using STS2Mobile.Maintenance;
 using STS2Mobile.Patches;
 
 namespace STS2Mobile;
@@ -55,6 +56,11 @@ public static class ModEntry
         _applied = true;
 
         PatchHelper.Log("Initializing STS2Mobile...");
+
+        // Repair install state before any game scene loads: stale texture imports
+        // garble card art and stale assembly copies silently drop patches after a
+        // game payload update.
+        GameInstallMaintenance.RunAtStartup();
 
         _harmony = new Harmony("com.sts2mobile");
 
