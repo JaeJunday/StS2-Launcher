@@ -317,7 +317,7 @@ public class LauncherController
                 {
                     _view.AppendColoredLog(
                         $"Launcher update available: v{result.LatestVersion} — "
-                            + "download at https://github.com/Ekyso/StS2-Launcher/releases/latest",
+                            + "download at https://github.com/JaeJunday/StS2-Launcher/releases/latest",
                         YellowLog
                     );
                     _view.SetStatus(

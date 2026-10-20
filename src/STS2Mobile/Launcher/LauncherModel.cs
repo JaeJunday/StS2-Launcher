@@ -419,6 +419,8 @@ public class LauncherModel : IDisposable
     private static string BetaBranchPrefPath =>
         Path.Combine(OS.GetDataDir(), "beta_branch_enabled");
 
+    // Defaults to true: this fork targets the public-beta branch, which is where
+    // the current game builds ship. Users can flip back to "public" in Settings.
     public static bool LoadBetaBranchPref()
     {
         try
@@ -427,7 +429,7 @@ public class LauncherModel : IDisposable
                 return File.ReadAllText(BetaBranchPrefPath).Trim() == "true";
         }
         catch { }
-        return false;
+        return true;
     }
 
     public static void SaveBetaBranchPref(bool enabled)

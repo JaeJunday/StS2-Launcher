@@ -35,8 +35,9 @@ public class DepotDownloader : IDisposable
     public const string PublicBranch = "public";
     public const string BetaBranch = "public-beta";
 
-    // Branch to download / check updates for. Defaults to the release build.
-    public string Branch { get; set; } = PublicBranch;
+    // Branch to download / check updates for. This fork defaults to public-beta,
+    // which is where the current game builds ship; "public" stays selectable.
+    public string Branch { get; set; } = BetaBranch;
 
     private readonly SteamConnection _connection;
     private readonly string _gameDir;

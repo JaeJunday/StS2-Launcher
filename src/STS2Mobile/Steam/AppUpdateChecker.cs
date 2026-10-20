@@ -9,8 +9,10 @@ namespace STS2Mobile.Steam;
 // latest GitHub release. Returns the download URL if an update is available.
 public static class AppUpdateChecker
 {
+    // This fork ships its own builds; checking upstream would advertise the
+    // unpatched 0.2.0 APK that cannot run current game versions.
     private const string ReleasesUrl =
-        "https://api.github.com/repos/Ekyso/StS2-Launcher/releases/latest";
+        "https://api.github.com/repos/JaeJunday/StS2-Launcher/releases/latest";
 
     public static async Task<AppUpdateResult> CheckAsync()
     {

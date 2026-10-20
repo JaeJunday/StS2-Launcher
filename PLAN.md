@@ -85,6 +85,22 @@ private dir and are lost unless backed up first.
 4. Repack + sign, verify install on a device, confirm: launcher UI → Steam login →
    depot download → game boot → no black screen → correct card art → cloud save.
 
+## 4b. Target branch and how a build is produced
+
+Target is Steam **public-beta** (`public-beta`): `DepotDownloader.Branch` and the
+launcher preference now default to it, and the in-app Settings toggle still exposes
+`public`. Manifest state stays per branch, so switching does not require re-downloading
+from scratch. The fork's own update check points at this repository instead of upstream.
+
+One command produces the APK once the game assemblies are in place:
+
+```bash
+tools/build-fork-apk.sh          # dotnet publish -> inject -> repack -> sign -> sha256
+```
+
+It regenerates `Maintenance/BclAssets.g.cs` from the base APK every time, so the
+BCL-ownership boundary always matches the packaged runtime.
+
 ## 5. Deliberately not done
 
 - No engine rebuild (impossible without the custom Godot source/FMOD SDK).
