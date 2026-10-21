@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32.SafeHandles;
 using SteamKit2;
 using SteamKit2.CDN;
 
@@ -28,7 +30,14 @@ public class DepotDownloader : IDisposable
 {
     private const uint AppId = 2868840;
     private const int MaxRetries = 5;
-    private const int MaxConcurrentDownloads = 8;
+
+    // Files fetched in parallel, and chunks of one file fetched in parallel. The
+    // game's PCK is a single multi-hundred-MB file, so per-file chunk pipelining is
+    // what actually determines throughput; chunk requests are tiny range GETs.
+    private const int MaxConcurrentDownloads = 4;
+    private const int ChunkConcurrency = 6;
+    private const int ChunkTimeoutSeconds = 40;
+    private const long ProgressLogIntervalBytes = 64L * 1024 * 1024;
 
     // Steam branches. The beta ("public-beta", open, no password) tracks the
     // public beta build; "public" is the default release build.
@@ -47,6 +56,8 @@ public class DepotDownloader : IDisposable
 
     private IReadOnlyList<Server> _servers;
     private int _serverIndex;
+    private long _lastProgressLog;
+    private DateTime _downloadStartUtc = DateTime.UtcNow;
     private readonly Dictionary<(uint, string), string> _cdnAuthTokens = new();
     private readonly Dictionary<
         (uint DepotId, ulong ManifestId),
@@ -396,18 +407,6 @@ public class DepotDownloader : IDisposable
 
         var oldManifest = LoadCachedManifest(depotId);
 
-        // Clean up temp files from interrupted previous downloads.
-        foreach (
-            var temp in Directory.GetFiles(_gameDir, "*.downloading", SearchOption.AllDirectories)
-        )
-        {
-            try
-            {
-                File.Delete(temp);
-            }
-            catch { }
-        }
-
         // Determine which files need downloading: new/changed files from the
         // manifest diff, plus any existing files that fail on-disk SHA-1 verification.
         var filesToDownload = GetFilesNeedingDownload(oldManifest, manifest, isUpdate);
@@ -427,6 +426,8 @@ public class DepotDownloader : IDisposable
         _progress.CompletedFiles = 0;
         _progress.TotalBytes = filesToDownload.Sum(f => (long)f.TotalSize);
         _progress.DownloadedBytes = 0;
+        _downloadStartUtc = DateTime.UtcNow;
+        _lastProgressLog = 0;
         ReportProgress();
 
         if (filesToDownload.Count == 0)
@@ -474,6 +475,15 @@ public class DepotDownloader : IDisposable
         Log($"Depot {depotId} complete");
     }
 
+    // Downloads one file, resuming from a previous attempt when possible.
+    //
+    // Steam's CDN serves ~1 MB range chunks, so a single-file sequential loop is
+    // dominated by round-trip latency: the game PCK alone is ~1.4 GB. Chunks are
+    // therefore fetched concurrently per file and written at their manifest offsets
+    // with RandomAccess (positional writes are safe on a shared handle). The
+    // ".downloading" temp file survives restarts; chunks that already hash
+    // correctly on disk are skipped, so an interrupted download resumes instead of
+    // re-burning hundreds of MB of mobile data.
     private async Task DownloadFileAsync(
         DepotManifest.FileData file,
         uint depotId,
@@ -497,7 +507,7 @@ public class DepotDownloader : IDisposable
             Directory.CreateDirectory(fileDir);
 
         // Validate existing file against manifest SHA-1 hash. A size-only check
-        // would miss corruption from interrupted writes (SetLength pre-allocates).
+        // would miss corruption from interrupted writes.
         if (File.Exists(filePath) && VerifyFileHash(filePath, file))
         {
             Interlocked.Add(ref _progress.DownloadedBytes, (long)file.TotalSize);
@@ -505,99 +515,102 @@ public class DepotDownloader : IDisposable
             return;
         }
 
-        // Write to a temp file, verify hash, then move into place. This prevents
-        // a partially-written file from being mistaken as complete on retry.
         var tempPath = filePath + ".downloading";
+        var expectedLength = (long)file.TotalSize;
+        var hadPartial = File.Exists(tempPath);
 
-        using (var fs = File.Create(tempPath))
+        if (hadPartial && new FileInfo(tempPath).Length != expectedLength)
         {
-            foreach (var chunk in file.Chunks.OrderBy(c => c.Offset))
+            File.Delete(tempPath);
+            hadPartial = false;
+        }
+
+        var chunks = file.Chunks.OrderBy(c => c.Offset).ToList();
+        var pending = chunks;
+        var handle = File.OpenHandle(
+            tempPath,
+            FileMode.OpenOrCreate,
+            FileAccess.ReadWrite,
+            FileShare.ReadWrite
+        );
+
+        try
+        {
+            if (RandomAccess.GetLength(handle) != expectedLength)
+                RandomAccess.SetLength(handle, expectedLength);
+
+            if (hadPartial)
             {
-                ct.ThrowIfCancellationRequested();
-
-                var buffer = new byte[chunk.UncompressedLength];
-                int written = 0;
-
-                for (int attempt = 0; attempt < MaxRetries; attempt++)
+                pending = chunks.Where(chunk => !ChunkMatchesOnDisk(handle, chunk)).ToList();
+                if (pending.Count < chunks.Count)
                 {
-                    var server = GetNextServer();
-                    try
-                    {
-                        written = await _cdnClient.DownloadDepotChunkAsync(
-                            depotId,
-                            chunk,
-                            server,
-                            buffer,
-                            depotKey
-                        );
+                    var pendingSet = new HashSet<DepotManifest.ChunkData>(pending);
+                    var reusedBytes = chunks
+                        .Where(chunk => !pendingSet.Contains(chunk))
+                        .Sum(chunk => (long)chunk.UncompressedLength);
+                    Log(
+                        $"[{fileName}] resuming: {chunks.Count - pending.Count}/{chunks.Count} "
+                            + $"chunks already on disk ({FormatSize(reusedBytes)})"
+                    );
+                    Interlocked.Add(ref _progress.DownloadedBytes, reusedBytes);
+                    ReportProgress();
+                }
+            }
 
-                        if (!VerifyChunkHash(buffer, written, chunk))
-                        {
-                            if (attempt < MaxRetries - 1)
+            if (pending.Count > 0)
+            {
+                using var semaphore = new SemaphoreSlim(ChunkConcurrency);
+                var failures = new List<Exception>();
+                var tasks = new List<Task>();
+
+                foreach (var chunk in pending)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await semaphore.WaitAsync(ct);
+
+                    tasks.Add(
+                        Task.Run(
+                            async () =>
                             {
-                                Log($"Chunk SHA-1 mismatch at offset {chunk.Offset}, retrying...");
-                                written = 0;
-                                continue;
-                            }
-                            throw new Exception(
-                                $"Chunk SHA-1 verification failed for {fileName} "
-                                    + $"at offset {chunk.Offset} after {MaxRetries} attempts"
-                            );
-                        }
-
-                        break;
-                    }
-                    catch (SteamKitWebRequestException ex)
-                        when (ex.StatusCode == HttpStatusCode.Forbidden)
-                    {
-                        var token = await GetCdnAuthToken(depotId, server);
-                        if (token != null)
-                        {
-                            written = await _cdnClient.DownloadDepotChunkAsync(
-                                depotId,
-                                chunk,
-                                server,
-                                buffer,
-                                depotKey,
-                                cdnAuthToken: token
-                            );
-
-                            if (!VerifyChunkHash(buffer, written, chunk))
-                            {
-                                if (attempt < MaxRetries - 1)
+                                try
                                 {
-                                    Log(
-                                        $"Chunk SHA-1 mismatch at offset {chunk.Offset}, retrying..."
+                                    var buffer = await FetchChunkAsync(depotId, chunk, depotKey, ct);
+                                    RandomAccess.Write(handle, buffer.AsSpan(), (long)chunk.Offset);
+                                    Interlocked.Add(
+                                        ref _progress.DownloadedBytes,
+                                        buffer.Length
                                     );
-                                    written = 0;
-                                    continue;
+                                    ReportProgress();
+                                    LogProgressIfDue();
                                 }
-                                throw new Exception(
-                                    $"Chunk SHA-1 verification failed for {fileName} "
-                                        + $"at offset {chunk.Offset} after {MaxRetries} attempts"
-                                );
-                            }
-
-                            break;
-                        }
-                    }
-                    catch (Exception ex) when (attempt < MaxRetries - 1)
-                    {
-                        Log($"Chunk download failed (attempt {attempt + 1}): {ex.Message}");
-                    }
+                                catch (Exception ex)
+                                {
+                                    lock (failures)
+                                        failures.Add(ex);
+                                }
+                                finally
+                                {
+                                    semaphore.Release();
+                                }
+                            },
+                            ct
+                        )
+                    );
                 }
 
-                if (written == 0 && chunk.UncompressedLength > 0)
+                await Task.WhenAll(tasks);
+
+                if (failures.Count > 0)
+                {
                     throw new Exception(
-                        $"Failed to download chunk for {fileName} after {MaxRetries} attempts"
+                        $"{failures.Count} chunk(s) failed for {fileName}: {failures[0].Message}"
                     );
-
-                fs.Seek((long)chunk.Offset, SeekOrigin.Begin);
-                fs.Write(buffer, 0, written);
-
-                Interlocked.Add(ref _progress.DownloadedBytes, written);
-                ReportProgress();
+                }
             }
+        }
+        finally
+        {
+            handle.Dispose();
         }
 
         // Verify the completed file before committing it.
@@ -608,6 +621,154 @@ public class DepotDownloader : IDisposable
         }
 
         File.Move(tempPath, filePath, overwrite: true);
+    }
+
+    // Fetches and decompresses a single chunk. A stalled range request is treated as
+    // a failure after ChunkTimeoutSeconds and retried on another CDN host, so one
+    // dead server cannot hang the whole download forever.
+    private async Task<byte[]> FetchChunkAsync(
+        uint depotId,
+        DepotManifest.ChunkData chunk,
+        byte[] depotKey,
+        CancellationToken ct
+    )
+    {
+        var server = GetNextServer();
+        Exception lastError = null;
+
+        for (var attempt = 0; attempt < MaxRetries; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var buffer = new byte[chunk.UncompressedLength];
+            var request = _cdnClient.DownloadDepotChunkAsync(
+                depotId,
+                chunk,
+                server,
+                buffer,
+                depotKey
+            );
+            var finished = await Task.WhenAny(
+                request,
+                Task.Delay(TimeSpan.FromSeconds(ChunkTimeoutSeconds), ct)
+            );
+
+            if (finished != request)
+            {
+                // The abandoned request still owns its buffer; leave it alone.
+                _ = request.ContinueWith(t => _ = t.Exception, TaskScheduler.Default);
+                lastError = new TimeoutException(
+                    $"chunk at offset {chunk.Offset} timed out after {ChunkTimeoutSeconds}s"
+                );
+                Log($"Chunk timeout at offset {chunk.Offset} ({server.Host}); retrying");
+                server = GetNextServer();
+                continue;
+            }
+
+            try
+            {
+                var written = await request;
+                if (!VerifyChunkHash(buffer, written, chunk))
+                {
+                    lastError = new Exception($"chunk SHA-1 mismatch at offset {chunk.Offset}");
+                    Log($"Chunk SHA-1 mismatch at offset {chunk.Offset}; retrying");
+                    server = GetNextServer();
+                    continue;
+                }
+
+                if (written != buffer.Length)
+                    Array.Resize(ref buffer, written);
+                return buffer;
+            }
+            catch (SteamKitWebRequestException ex) when (ex.StatusCode == HttpStatusCode.Forbidden)
+            {
+                var token = await GetCdnAuthToken(depotId, server);
+                if (token == null)
+                {
+                    lastError = ex;
+                    Log($"Chunk forbidden and no CDN token for {server.Host}; retrying");
+                    server = GetNextServer();
+                    continue;
+                }
+
+                var authedBuffer = new byte[chunk.UncompressedLength];
+                try
+                {
+                    var written = await _cdnClient.DownloadDepotChunkAsync(
+                        depotId,
+                        chunk,
+                        server,
+                        authedBuffer,
+                        depotKey,
+                        cdnAuthToken: token
+                    );
+                    if (!VerifyChunkHash(authedBuffer, written, chunk))
+                    {
+                        lastError = new Exception(
+                            $"chunk SHA-1 mismatch at offset {chunk.Offset}"
+                        );
+                        server = GetNextServer();
+                        continue;
+                    }
+
+                    if (written != authedBuffer.Length)
+                        Array.Resize(ref authedBuffer, written);
+                    return authedBuffer;
+                }
+                catch (Exception inner)
+                {
+                    lastError = inner;
+                    Log($"Chunk download failed with token: {inner.Message}");
+                    server = GetNextServer();
+                }
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                Log($"Chunk download failed (attempt {attempt + 1}): {ex.Message}");
+                server = GetNextServer();
+            }
+        }
+
+        throw new Exception(
+            $"Failed to download chunk at offset {chunk.Offset} after {MaxRetries} attempts: "
+                + $"{lastError?.Message}"
+        );
+    }
+
+    // Re-hashes a chunk already present in a partial temp file.
+    private static bool ChunkMatchesOnDisk(SafeFileHandle handle, DepotManifest.ChunkData chunk)
+    {
+        if (chunk.ChunkID == null || chunk.ChunkID.Length == 0 || chunk.UncompressedLength == 0)
+            return false;
+
+        var buffer = new byte[chunk.UncompressedLength];
+        var read = 0;
+        while (read < buffer.Length)
+        {
+            var n = RandomAccess.Read(handle, buffer.AsSpan(read), (long)chunk.Offset + read);
+            if (n <= 0)
+                return false;
+            read += n;
+        }
+
+        var hash = System.Security.Cryptography.SHA1.HashData(buffer);
+        return hash.AsSpan().SequenceEqual(chunk.ChunkID);
+    }
+
+    private void LogProgressIfDue()
+    {
+        var downloaded = Interlocked.Read(ref _progress.DownloadedBytes);
+        if (downloaded - _lastProgressLog < ProgressLogIntervalBytes)
+            return;
+        _lastProgressLog = downloaded;
+
+        var elapsed = DateTime.UtcNow - _downloadStartUtc;
+        var speed = elapsed.TotalSeconds > 0 ? downloaded / elapsed.TotalSeconds : 0;
+        Log(
+            $"{FormatSize(downloaded)} / {FormatSize(_progress.TotalBytes)} "
+                + $"({_progress.Percentage:F1}%), {FormatSize((long)speed)}/s"
+        );
     }
 
     // Computes SHA-1 of a decompressed chunk and compares it to the manifest ChunkID.
@@ -626,12 +787,43 @@ public class DepotDownloader : IDisposable
         try
         {
             var info = new FileInfo(path);
-            if (info.Length != (long)file.TotalSize)
+            if ((ulong)info.Length != file.TotalSize)
                 return false;
+
+            // The PCK is rewritten in place to drop the Sentry autoload, which breaks
+            // its manifest hash forever. Accept our own patched copy instead of
+            // re-downloading a 1.4 GB file on every update check.
+            if (IsPatchedPckAccepted(path, info))
+                return true;
 
             using var fs = File.OpenRead(path);
             var hash = System.Security.Cryptography.SHA1.HashData(fs);
             return hash.AsSpan().SequenceEqual(file.FileHash);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // Marker written next to the PCK after in-place patching: size + mtime are enough
+    // to tell "our patched copy" from "stale or half-written file" without hashing it.
+    private static string PatchMarkerPath(string path) => path + ".patched";
+
+    private static bool IsPatchedPckAccepted(string path, FileInfo info)
+    {
+        try
+        {
+            var marker = PatchMarkerPath(path);
+            if (!File.Exists(marker))
+                return false;
+
+            var lines = File.ReadAllLines(marker);
+            if (lines.Length < 3 || lines[0] != "v1")
+                return false;
+
+            return lines[1] == info.Length.ToString()
+                && lines[2] == info.LastWriteTimeUtc.Ticks.ToString();
         }
         catch
         {
@@ -858,7 +1050,21 @@ public class DepotDownloader : IDisposable
             }
 
             if (patched)
+            {
+                var info = new FileInfo(pckPath);
+                info.Refresh();
+                File.WriteAllLines(
+                    PatchMarkerPath(pckPath),
+                    new[]
+                    {
+                        "v1",
+                        info.Length.ToString(),
+                        info.LastWriteTimeUtc.Ticks.ToString(),
+                        "sentry-autoload-removed",
+                    }
+                );
                 PatchHelper.Log("Patched game PCK: removed Sentry plugin references");
+            }
         }
         catch (Exception ex)
         {

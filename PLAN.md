@@ -101,6 +101,27 @@ tools/build-fork-apk.sh          # dotnet publish -> inject -> repack -> sign ->
 It regenerates `Maintenance/BclAssets.g.cs` from the base APK every time, so the
 BCL-ownership boundary always matches the packaged runtime.
 
+## 4c. Download path rewrite (post-beta feedback)
+
+First device report on the beta build: data was consumed but the download never
+finished. Reading 0.2.0's downloader explained it — it walked one manifest chunk at
+a time per file with a *new CDN host on every chunk*, so throughput was bound by
+round-trip latency, and the ~1.4 GB PCK alone is ~1400 sequential chunks. Upstream
+issue #63 ("1.7 GB takes over an hour") is the same defect.
+
+Changes in `Steam/DepotDownloader.cs`:
+
+- chunks of one file are fetched concurrently (`ChunkConcurrency = 6`) and written
+  positionally with `RandomAccess`, so the big PCK is no longer serialized;
+- a stalled range request now fails after 40 s and retries on another host instead of
+  hanging the whole download forever;
+- `.downloading` temp files survive restarts; on resume every chunk already on disk is
+  re-hashed and skipped, so an interrupted run does not re-burn mobile data;
+- per-file failures are aggregated instead of aborting the whole depot silently;
+- progress is logged every 64 MB with speed, and the PCK's Sentry patch writes a
+  sidecar marker so its broken manifest hash no longer triggers a 1.4 GB re-download
+  on every update check (that alone re-downloaded the PCK on every run).
+
 ## 5. Deliberately not done
 
 - No engine rebuild (impossible without the custom Godot source/FMOD SDK).
