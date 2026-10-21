@@ -112,6 +112,7 @@ print("entries:", count)
 PY
 
 echo "[4/4] sign (v1+v2+v3)"
+mkdir -p "$(dirname "$OUT_APK")"
 "$BT/apksigner" sign \
     --ks "$KEYSTORE" --ks-key-alias "$KS_ALIAS" \
     --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
